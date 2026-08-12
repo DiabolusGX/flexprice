@@ -439,6 +439,8 @@ func buildWorkerConfig(
 		activitiesList = append(activitiesList,
 			planActivities.SyncPlanPrices,
 			planActivities.SyncPlanPricesV2,
+			planActivities.SyncPlanPricesV2Shard,
+			planActivities.ReleasePriceSyncLock,
 			qbPriceSyncActivities.SyncPriceToQuickBooks,
 		)
 

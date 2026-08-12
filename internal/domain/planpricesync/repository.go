@@ -20,6 +20,20 @@ type PlanLineItemCreationDelta struct {
 	CustomerID     string // subscription's customer_id, for reprocessing without listing subscriptions
 }
 
+// PlanSubForSync carries the subscription fields the V2 sync loop needs to build
+// a line item without a second Ent round trip. Returned by ListPlanLineItemsToCreateV2
+// so the service can populate its subMap directly from the discovery query.
+type PlanSubForSync struct {
+	ID                  string
+	CustomerID          string
+	Currency            string
+	BillingPeriod       string
+	BillingPeriodCount  int
+	StartDate           time.Time
+	EndDate             *time.Time
+	SyncedPriceSequence int64
+}
+
 type ListPlanLineItemsToTerminateParams struct {
 	PlanID string
 	Limit  int
@@ -90,14 +104,19 @@ type Repository interface {
 	// ListPlanLineItemsToCreateV2 returns missing (subscription_id, price_id)
 	// pairs for a plan, narrowed to prices that changed since each
 	// subscription's synced_price_sequence. Also returns the full set of
-	// stale sub IDs in this page (so stamp can be scoped exactly to the
-	// discovery window even when no pairs were produced). The page
+	// stale subs in this page (with the fields needed to build line items,
+	// so callers don't need a second round trip). Stamping is scoped to the
+	// returned subs so it works even when no pairs were produced. The page
 	// advances implicitly via stamping — stamped subs fall out of the
 	// `synced_price_sequence < TargetSeq` filter on the next call.
+	//
+	// Sharding: when p.ShardCount > 1, only subs whose id hashes into
+	// `hashtext(id) % ShardCount == ShardIdx` are returned. ShardCount==0/1
+	// disables sharding (single-shard mode covers all subs).
 	ListPlanLineItemsToCreateV2(
 		ctx context.Context,
 		p ListPlanLineItemsToCreateV2Params,
-	) (items []PlanLineItemCreationDelta, staleSubIDs []string, err error)
+	) (items []PlanLineItemCreationDelta, staleSubs []PlanSubForSync, err error)
 
 	// TerminatePlanPricesLineItemsV2 sets end_date on live plan-derived line
 	// items belonging to the given subs whose price has been ended. Scoping
@@ -125,6 +144,12 @@ type ListPlanLineItemsToCreateV2Params struct {
 	PlanID    string
 	TargetSeq int64 // subs stale relative to this value are in scope
 	Limit     int   // page size (defaults to implementation-defined)
+
+	// ShardCount / ShardIdx partition the stale-sub set across parallel workers.
+	// A row belongs to this shard when hashtext(id) % ShardCount == ShardIdx.
+	// ShardCount <= 1 disables sharding (this call sees all matching subs).
+	ShardCount int
+	ShardIdx   int
 }
 
 // TerminatePlanPricesLineItemsV2Params drives the V2 termination UPDATE.

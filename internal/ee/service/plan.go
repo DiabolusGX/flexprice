@@ -558,7 +558,14 @@ func (s *planService) SyncPlanPrices(ctx context.Context, planID string) (*dto.S
 	return response, nil
 }
 
-// SyncPlanPricesV2 is the sequence-driven plan-price sync.
+// SyncPlanPricesV2 preserves the pre-fanout entry point: a single-shard sync
+// with no heartbeat. New Temporal activities should call
+// [planService.SyncPlanPricesV2Shard] so they can heartbeat and run in parallel.
+func (s *planService) SyncPlanPricesV2(ctx context.Context, planID string) (*dto.SyncPlanPricesResponse, error) {
+	return s.SyncPlanPricesV2Shard(ctx, planID, interfaces.SyncPlanPricesV2Options{})
+}
+
+// SyncPlanPricesV2Shard is the sequence-driven plan-price sync loop.
 //
 // Compared to V1 (SyncPlanPrices):
 //   - Discovery is narrowed to prices whose `sequence` is greater than each
@@ -571,6 +578,12 @@ func (s *planService) SyncPlanPrices(ctx context.Context, planID string) (*dto.S
 //     as live. Stamping is the implicit cursor: stamped subs fall out of
 //     the next discovery via `synced_price_sequence < TargetSeq`.
 //
+// Sharding: when opts.ShardCount > 1, this call processes only the subs
+// whose id hashes into opts.ShardIdx. Callers should invoke ShardCount
+// instances in parallel to cover the full stale-sub set. Because shards
+// operate on disjoint subs, they never contend on the same
+// subscriptions/subscription_line_items rows.
+//
 // No transactions: every step (create, terminate, stamp) is idempotent, so a
 // mid-run failure resumes correctly on the next invocation. Subs that aren't
 // stamped get re-discovered; already-created line items are skipped via the
@@ -580,7 +593,7 @@ func (s *planService) SyncPlanPrices(ctx context.Context, planID string) (*dto.S
 //
 // The line-item construction logic (display name, quantity, metadata, etc.)
 // is reused from `createPlanLineItem` to avoid behavior drift.
-func (s *planService) SyncPlanPricesV2(ctx context.Context, planID string) (*dto.SyncPlanPricesResponse, error) {
+func (s *planService) SyncPlanPricesV2Shard(ctx context.Context, planID string, opts interfaces.SyncPlanPricesV2Options) (*dto.SyncPlanPricesResponse, error) {
 	syncStartTime := time.Now()
 
 	plan, err := s.PlanRepo.Get(ctx, planID)
@@ -598,7 +611,10 @@ func (s *planService) SyncPlanPricesV2(ctx context.Context, planID string) (*dto
 	}
 
 	if targetSeq == 0 {
-		s.Logger.Info(ctx, "no plan prices to sync (v2)", "plan_id", planID)
+		s.Logger.Info(ctx, "no plan prices to sync (v2)",
+			"plan_id", planID,
+			"shard_count", opts.ShardCount,
+			"shard_idx", opts.ShardIdx)
 		return &dto.SyncPlanPricesResponse{
 			PlanID:  planID,
 			Message: "No plan prices to sync",
@@ -618,16 +634,37 @@ func (s *planService) SyncPlanPricesV2(ctx context.Context, planID string) (*dto
 
 	for {
 		pageIteration++
-		missingPairs, subIDsInPage, listErr := s.PlanPriceSyncRepo.ListPlanLineItemsToCreateV2(ctx, planpricesync.ListPlanLineItemsToCreateV2Params{
-			PlanID:    planID,
-			TargetSeq: targetSeq,
-			Limit:     2000,
+		missingPairs, staleSubs, listErr := s.PlanPriceSyncRepo.ListPlanLineItemsToCreateV2(ctx, planpricesync.ListPlanLineItemsToCreateV2Params{
+			PlanID:     planID,
+			TargetSeq:  targetSeq,
+			Limit:      2000,
+			ShardCount: opts.ShardCount,
+			ShardIdx:   opts.ShardIdx,
 		})
 		if listErr != nil {
 			return nil, listErr
 		}
-		if len(subIDsInPage) == 0 {
+		if len(staleSubs) == 0 {
 			break
+		}
+
+		// Collect the sub IDs once — reused by terminate and stamp.
+		subIDsInPage := make([]string, len(staleSubs))
+		subMap := make(map[string]*subscription.Subscription, len(staleSubs))
+		for i, sd := range staleSubs {
+			subIDsInPage[i] = sd.ID
+			// Only the fields createPlanLineItem reads are needed; leaving
+			// the rest zeroed is safe. Copying by value avoids retaining
+			// the slice element pointer past the loop iteration.
+			subMap[sd.ID] = &subscription.Subscription{
+				ID:                 sd.ID,
+				CustomerID:         sd.CustomerID,
+				Currency:           sd.Currency,
+				BillingPeriod:      types.BillingPeriod(sd.BillingPeriod),
+				BillingPeriodCount: sd.BillingPeriodCount,
+				StartDate:          sd.StartDate,
+				EndDate:            sd.EndDate,
+			}
 		}
 
 		lineItemsFoundForCreation += len(missingPairs)
@@ -636,7 +673,6 @@ func (s *planService) SyncPlanPricesV2(ctx context.Context, planID string) (*dto
 		if len(missingPairs) > 0 {
 			creationStart := time.Now()
 			priceIDs := lo.Uniq(lo.Map(missingPairs, func(pair planpricesync.PlanLineItemCreationDelta, _ int) string { return pair.PriceID }))
-			subscriptionIDs := lo.Uniq(lo.Map(missingPairs, func(pair planpricesync.PlanLineItemCreationDelta, _ int) string { return pair.SubscriptionID }))
 
 			priceFilter := types.NewNoLimitPriceFilter().
 				WithPriceIDs(priceIDs).
@@ -647,14 +683,6 @@ func (s *planService) SyncPlanPricesV2(ctx context.Context, planID string) (*dto
 				return nil, perr
 			}
 			priceMap := lo.KeyBy(prices, func(p *domainPrice.Price) string { return p.ID })
-
-			subFilter := types.NewNoLimitSubscriptionFilter()
-			subFilter.SubscriptionIDs = subscriptionIDs
-			subs, serr := s.SubRepo.List(ctx, subFilter)
-			if serr != nil {
-				return nil, serr
-			}
-			subMap := lo.KeyBy(subs, func(sub *subscription.Subscription) string { return sub.ID })
 
 			lineItems := make([]*subscription.SubscriptionLineItem, 0, len(missingPairs))
 			for _, pair := range missingPairs {
@@ -721,21 +749,30 @@ func (s *planService) SyncPlanPricesV2(ctx context.Context, planID string) (*dto
 		//    marker — if we crash before reaching here, the same subs
 		//    re-appear in the next run's discovery.
 		stampStart := time.Now()
-		stamped, serr := s.PlanPriceSyncRepo.StampSubsAsSynced(ctx, planpricesync.StampSubsAsSyncedParams{
+		stamped, sserr := s.PlanPriceSyncRepo.StampSubsAsSynced(ctx, planpricesync.StampSubsAsSyncedParams{
 			TargetSeq: targetSeq,
 			SubIDs:    subIDsInPage,
 		})
-		if serr != nil {
-			return nil, serr
+		if sserr != nil {
+			return nil, sserr
 		}
 		subsStamped += stamped
 		stampTotalDuration += time.Since(stampStart)
+
+		// Fire the heartbeat AFTER stamping so the reported page cursor
+		// corresponds to durably-persisted progress. A callback panic escapes
+		// the service intentionally — the activity should be the only caller.
+		if opts.OnPageComplete != nil {
+			opts.OnPageComplete(pageIteration)
+		}
 	}
 
 	totalSyncDuration := time.Since(syncStartTime)
 	s.Logger.Info(ctx, "completed plan price synchronization (v2)",
 		"plan_id", planID,
 		"target_sequence", targetSeq,
+		"shard_count", opts.ShardCount,
+		"shard_idx", opts.ShardIdx,
 		"page_iterations", pageIteration,
 		"line_items_found_for_creation", lineItemsFoundForCreation,
 		"line_items_created", lineItemsCreated,

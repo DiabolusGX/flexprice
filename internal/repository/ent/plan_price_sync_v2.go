@@ -2,6 +2,7 @@ package ent
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -69,9 +70,17 @@ func (r *planPriceSyncRepository) CurrentPlanSequence(
 func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 	ctx context.Context,
 	p planpricesync.ListPlanLineItemsToCreateV2Params,
-) (items []planpricesync.PlanLineItemCreationDelta, staleSubIDs []string, err error) {
+) (items []planpricesync.PlanLineItemCreationDelta, staleSubs []planpricesync.PlanSubForSync, err error) {
 	if p.PlanID == "" {
 		return nil, nil, ierr.NewError("plan_id is required").Mark(ierr.ErrValidation)
+	}
+	if p.ShardCount < 0 || p.ShardIdx < 0 || (p.ShardCount > 0 && p.ShardIdx >= p.ShardCount) {
+		return nil, nil, ierr.NewError("invalid shard params").
+			WithReportableDetails(map[string]interface{}{
+				"shard_count": p.ShardCount,
+				"shard_idx":   p.ShardIdx,
+			}).
+			Mark(ierr.ErrValidation)
 	}
 	limit := p.Limit
 	if limit <= 0 {
@@ -82,20 +91,31 @@ func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 	environmentID := types.GetEnvironmentID(ctx)
 
 	span := StartRepositorySpan(ctx, "plan_price_sync_v2", "list_plan_line_items_to_create", map[string]interface{}{
-		"plan_id":    p.PlanID,
-		"target_seq": p.TargetSeq,
-		"limit":      limit,
+		"plan_id":     p.PlanID,
+		"target_seq":  p.TargetSeq,
+		"limit":       limit,
+		"shard_count": p.ShardCount,
+		"shard_idx":   p.ShardIdx,
 	})
 	defer FinishSpan(span)
 
+	// Shard predicate: hashtext(id) % $count = $idx keeps stale-sub sets disjoint
+	// across parallel workers. Disabled for ShardCount <= 1 so single-shard runs
+	// pay no extra work.
+	shardPredicate := ""
+	if p.ShardCount > 1 {
+		shardPredicate = fmt.Sprintf(" AND ((abs(hashtext(id)) %% %d) = %d)", p.ShardCount, p.ShardIdx)
+	}
+
 	// Two result sets in one round trip:
-	//   kind='pair' — actual missing pair
-	//   kind='sub'  — one row per stale sub in the page (for stamping;
-	//                 includes subs that produced no pairs)
+	//   kind='pair' — actual missing pair (sub-detail columns are NULL)
+	//   kind='sub'  — one row per stale sub in the page (carries the fields
+	//                 the service needs to build line items, so no second
+	//                 Ent round trip is required)
 	query := fmt.Sprintf(`
 		WITH stale_subs AS (
 			SELECT id, customer_id, currency, billing_period, billing_period_count,
-			       start_date, synced_price_sequence
+			       start_date, end_date, synced_price_sequence
 			FROM subscriptions
 			WHERE tenant_id = $1
 			  AND environment_id = $2
@@ -104,6 +124,7 @@ func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 			  AND subscription_status IN ('%s','%s', '%s', '%s')
 			  AND subscription_type IN (%s)
 			  AND synced_price_sequence < $4
+			  %s
 			-- Order matches the (plan_id, synced_price_sequence, id) partial index key so
 			-- LIMIT $5 becomes an index range scan that stops after $5 rows instead of a
 			-- Top-N sort over every stale sub in the plan.
@@ -147,9 +168,21 @@ func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 			        AND li.entity_type = '%s'
 			  )
 		)
-		SELECT 'pair'::text AS kind, subscription_id, price_id, customer_id FROM pairs
+		SELECT 'pair'::text AS kind,
+		       subscription_id, price_id, customer_id,
+		       NULL::text                    AS currency,
+		       NULL::text                    AS billing_period,
+		       NULL::int                     AS billing_period_count,
+		       NULL::timestamptz             AS start_date,
+		       NULL::timestamptz             AS end_date,
+		       NULL::bigint                  AS synced_price_sequence
+		FROM pairs
 		UNION ALL
-		SELECT 'sub'::text  AS kind, id, '', '' FROM stale_subs
+		SELECT 'sub'::text  AS kind,
+		       id, ''::text AS price_id, customer_id,
+		       currency, billing_period, billing_period_count,
+		       start_date, end_date, synced_price_sequence
+		FROM stale_subs
 	`,
 		string(types.StatusPublished),
 		string(types.SubscriptionStatusActive),
@@ -158,6 +191,7 @@ func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 		string(types.SubscriptionStatusIncomplete),
 		// Sub types that own plan line items. Inherited is excluded by design
 		strings.Join(lo.Map(types.SubscriptionTypesWithLineItems, func(t types.SubscriptionType, _ int) string { return fmt.Sprintf("'%s'", string(t)) }), ","),
+		shardPredicate,
 		string(types.StatusPublished),
 		string(types.PRICE_ENTITY_TYPE_PLAN),
 		string(types.PRICE_TYPE_USAGE),
@@ -180,8 +214,17 @@ func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 	defer rows.Close()
 
 	for rows.Next() {
-		var kind, sub, price, customer string
-		if scanErr := rows.Scan(&kind, &sub, &price, &customer); scanErr != nil {
+		var (
+			kind, sub, price, customer                   string
+			currency, billingPeriod                      sql.NullString
+			billingPeriodCount, syncedPriceSequenceNulls sql.NullInt64
+			startDate, endDate                           sql.NullTime
+		)
+		if scanErr := rows.Scan(
+			&kind, &sub, &price, &customer,
+			&currency, &billingPeriod, &billingPeriodCount,
+			&startDate, &endDate, &syncedPriceSequenceNulls,
+		); scanErr != nil {
 			SetSpanError(span, scanErr)
 			return nil, nil, ierr.WithError(scanErr).
 				WithHint("Failed to scan V2 sync row").
@@ -195,7 +238,21 @@ func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 				CustomerID:     customer,
 			})
 		case "sub":
-			staleSubIDs = append(staleSubIDs, sub)
+			var endPtr *time.Time
+			if endDate.Valid {
+				t := endDate.Time
+				endPtr = &t
+			}
+			staleSubs = append(staleSubs, planpricesync.PlanSubForSync{
+				ID:                  sub,
+				CustomerID:          customer,
+				Currency:            currency.String,
+				BillingPeriod:       billingPeriod.String,
+				BillingPeriodCount:  int(billingPeriodCount.Int64),
+				StartDate:           startDate.Time,
+				EndDate:             endPtr,
+				SyncedPriceSequence: syncedPriceSequenceNulls.Int64,
+			})
 		}
 	}
 	if rerr := rows.Err(); rerr != nil {
@@ -206,7 +263,7 @@ func (r *planPriceSyncRepository) ListPlanLineItemsToCreateV2(
 	}
 
 	SetSpanSuccess(span)
-	return items, staleSubIDs, nil
+	return items, staleSubs, nil
 }
 
 // TerminatePlanPricesLineItemsV2 sets end_date on live plan-derived line

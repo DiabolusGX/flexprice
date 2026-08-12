@@ -188,15 +188,22 @@ func (r *InMemoryPlanPriceSyncStore) StampSubsAsSynced(
 }
 
 // ListPlanLineItemsToCreateV2 returns missing (sub, price) pairs and the full
-// set of stale sub IDs for a plan. A sub is stale when
+// set of stale subs for a plan. A sub is stale when
 // synced_price_sequence < TargetSeq. A pair is missing when a candidate plan
 // price has no matching plan-derived line item on the sub.
+//
+// Sharding: when p.ShardCount > 1, stale subs are partitioned by a stable
+// FNV-based hash so shards see disjoint slices. Mirrors the Postgres
+// `hashtext(id) % ShardCount == ShardIdx` predicate.
 func (r *InMemoryPlanPriceSyncStore) ListPlanLineItemsToCreateV2(
 	ctx context.Context,
 	p planpricesync.ListPlanLineItemsToCreateV2Params,
-) ([]planpricesync.PlanLineItemCreationDelta, []string, error) {
+) ([]planpricesync.PlanLineItemCreationDelta, []planpricesync.PlanSubForSync, error) {
 	if p.PlanID == "" {
 		return nil, nil, ierr.NewError("plan_id is required").Mark(ierr.ErrValidation)
+	}
+	if p.ShardCount < 0 || p.ShardIdx < 0 || (p.ShardCount > 0 && p.ShardIdx >= p.ShardCount) {
+		return nil, nil, ierr.NewError("invalid shard params").Mark(ierr.ErrValidation)
 	}
 	limit := p.Limit
 	if limit <= 0 {
@@ -207,12 +214,26 @@ func (r *InMemoryPlanPriceSyncStore) ListPlanLineItemsToCreateV2(
 	subPricesBySub := r.subscriptionPricesBySub(ctx)
 	lineItemsBySub := r.planLineItemsBySub(ctx)
 
-	staleSubs := r.staleSubsForPlan(ctx, p.PlanID, p.TargetSeq, limit)
-	staleSubIDs := make([]string, 0, len(staleSubs))
+	staleSubs := r.staleSubsForPlan(ctx, p.PlanID, p.TargetSeq, limit, p.ShardCount, p.ShardIdx)
+	staleSubData := make([]planpricesync.PlanSubForSync, 0, len(staleSubs))
 	var items []planpricesync.PlanLineItemCreationDelta
 
 	for _, sub := range staleSubs {
-		staleSubIDs = append(staleSubIDs, sub.ID)
+		var endPtr *time.Time
+		if sub.EndDate != nil {
+			t := *sub.EndDate
+			endPtr = &t
+		}
+		staleSubData = append(staleSubData, planpricesync.PlanSubForSync{
+			ID:                  sub.ID,
+			CustomerID:          sub.CustomerID,
+			Currency:            sub.Currency,
+			BillingPeriod:       string(sub.BillingPeriod),
+			BillingPeriodCount:  sub.BillingPeriodCount,
+			StartDate:           sub.StartDate,
+			EndDate:             endPtr,
+			SyncedPriceSequence: sub.SyncedPriceSequence,
+		})
 		for _, pp := range planPrices {
 			if !priceMatchesSub(pp, sub) {
 				continue
@@ -236,7 +257,7 @@ func (r *InMemoryPlanPriceSyncStore) ListPlanLineItemsToCreateV2(
 			})
 		}
 	}
-	return items, staleSubIDs, nil
+	return items, staleSubData, nil
 }
 
 // TerminatePlanPricesLineItemsV2 sets end_date on live plan-derived line items
@@ -547,19 +568,43 @@ func (r *InMemoryPlanPriceSyncStore) candidateSubsForPlan(ctx context.Context, p
 	return out
 }
 
-func (r *InMemoryPlanPriceSyncStore) staleSubsForPlan(ctx context.Context, planID string, targetSeq int64, limit int) []*subscription.Subscription {
+func (r *InMemoryPlanPriceSyncStore) staleSubsForPlan(ctx context.Context, planID string, targetSeq int64, limit, shardCount, shardIdx int) []*subscription.Subscription {
 	subs := r.candidateSubsForPlan(ctx, planID)
 	stale := subs[:0]
 	for _, sub := range subs {
-		if sub.SyncedPriceSequence < targetSeq {
-			stale = append(stale, sub)
+		if sub.SyncedPriceSequence >= targetSeq {
+			continue
 		}
+		if shardCount > 1 && shardOf(sub.ID, shardCount) != shardIdx {
+			continue
+		}
+		stale = append(stale, sub)
 	}
 	sort.Slice(stale, func(i, j int) bool { return stale[i].ID < stale[j].ID })
 	if limit > 0 && len(stale) > limit {
 		stale = stale[:limit]
 	}
 	return stale
+}
+
+// shardOf mirrors the Postgres `abs(hashtext(id)) % shardCount` predicate closely
+// enough for in-memory tests: a stable, well-distributed non-negative bucket for
+// each ID. It does not need bit-for-bit parity with Postgres' hashtext.
+func shardOf(id string, shardCount int) int {
+	if shardCount <= 1 {
+		return 0
+	}
+	// FNV-1a 64-bit; stable across runs and evenly distributed for UUID-like ids.
+	const (
+		offset64 uint64 = 14695981039346656037
+		prime64  uint64 = 1099511628211
+	)
+	h := offset64
+	for i := 0; i < len(id); i++ {
+		h ^= uint64(id[i])
+		h *= prime64
+	}
+	return int(h % uint64(shardCount))
 }
 
 func priceMatchesSub(p *price.Price, sub *subscription.Subscription) bool {

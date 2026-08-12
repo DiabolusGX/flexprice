@@ -63,6 +63,19 @@ type PlanService interface {
 	ClonePlan(ctx context.Context, id string, req dto.ClonePlanRequest) (*dto.PlanResponse, error)
 	SyncPlanPrices(ctx context.Context, id string) (*dto.SyncPlanPricesResponse, error)
 	SyncPlanPricesV2(ctx context.Context, id string) (*dto.SyncPlanPricesResponse, error)
+	SyncPlanPricesV2Shard(ctx context.Context, id string, opts SyncPlanPricesV2Options) (*dto.SyncPlanPricesResponse, error)
+}
+
+// SyncPlanPricesV2Options tunes SyncPlanPricesV2Shard without coupling the
+// service layer to the Temporal SDK.
+type SyncPlanPricesV2Options struct {
+	// ShardCount / ShardIdx partition the stale-sub set for parallel workers.
+	// Zero or one disables sharding (this call processes every stale sub).
+	ShardCount int
+	ShardIdx   int
+	// OnPageComplete fires after each page (create → terminate → stamp) succeeds.
+	// The activity wrapper uses this to record a Temporal heartbeat.
+	OnPageComplete func(pageIteration int)
 }
 
 type EntityIntegrationMappingService interface {
