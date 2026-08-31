@@ -207,6 +207,45 @@ func TestValidateIncludePriceIDs_UnknownAndIncompatible(t *testing.T) {
 	}
 }
 
+// Regression scenario from user: quarterly sub + include_price_ids containing
+// a monthly plan price + override_line_items targeting that monthly price.
+// The include path must include the monthly price in the filtered set so the
+// downstream priceMap has it and override lookup succeeds.
+func TestIncludePriceIDs_MonthlyPriceOnQuarterlySub_AvailableForOverride(t *testing.T) {
+	svc := &subscriptionService{}
+	sub := mkSub(types.BILLING_PERIOD_QUARTER, 1)
+
+	planPrices := []*dto.PriceResponse{
+		mkPrice("plan_q1", types.BILLING_PERIOD_QUARTER, 1),
+		mkPrice("plan_q2", types.BILLING_PERIOD_QUARTER, 1),
+		mkPrice("plan_m1", types.BILLING_PERIOD_MONTHLY, 1), // the monthly price the user wants to override
+	}
+	includeIDs := []string{"plan_q1", "plan_q2", "plan_m1"}
+
+	// Step 1: validateIncludePriceIDs must accept all three (all cadence-compat).
+	if err := svc.validateIncludePriceIDs("plan_test", sub, includeIDs, planPrices); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	// Step 2: filterValidPricesForSubscription must return all three in validPrices
+	// (that's what feeds the priceMap the override validator looks up against).
+	pIDs := &includeIDs
+	validPrices := filterValidPricesForSubscription(planPrices, sub, pIDs)
+	got := idsOf(validPrices)
+	assertSameIDs(t, includeIDs, got)
+
+	// Step 3: the priceMap the sub-create handler builds from validPrices must
+	// contain plan_m1 so ProcessSubscriptionPriceOverrides can find it. This
+	// asserts the exact contract that avoids the "price not found in plan" 400.
+	priceMap := make(map[string]*dto.PriceResponse, len(validPrices))
+	for _, p := range validPrices {
+		priceMap[p.Price.ID] = p
+	}
+	if _, ok := priceMap["plan_m1"]; !ok {
+		t.Fatal("priceMap missing plan_m1 — override_line_items and line_item_commitments targeting it would fail with 'not found in plan'")
+	}
+}
+
 func TestValidateIncludePriceIDs_WrongCurrency(t *testing.T) {
 	svc := &subscriptionService{}
 	sub := mkSub(types.BILLING_PERIOD_MONTHLY, 1)
