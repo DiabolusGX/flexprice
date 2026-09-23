@@ -38,22 +38,19 @@ func dayOf(t time.Time) time.Time {
 	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC)
 }
 
-// inclusiveLastDay converts the engine's exclusive period end into the last
-// day the period actually covers. Only a midnight end excludes its own day;
-// an end part-way through a day still belongs to that day, and subtracting a
-// whole day from it would invert a period that opened and closed the same day
-// — a same-day cancellation, for instance.
+// inclusiveLastDay is the last day a period covers, matching the day-walk in
+// buildUsageCurve: it emits days strictly before the end's own date, folding
+// a mid-day end's usage back into the previous day. Taking the end's own date
+// instead would reach a day into the next period, whose first day it is.
 func inclusiveLastDay(exclusiveEnd time.Time) time.Time {
-	day := dayOf(exclusiveEnd)
-	if exclusiveEnd.UTC().Equal(day) {
-		return day.AddDate(0, 0, -1)
-	}
-	return day
+	return dayOf(exclusiveEnd).AddDate(0, 0, -1)
 }
 
 // periodDays keys a fact row to the days its billing window covers. Start
 // stays exact because usage reads bound on it; only the stored and matched
-// ends are day-grained.
+// ends are day-grained. A window opening and closing on one date has no
+// preceding day to end on, so it is clamped to that date rather than
+// inverting.
 func periodDays(start, exclusiveEnd time.Time) revenuePeriod {
 	end := inclusiveLastDay(exclusiveEnd)
 	if end.Before(dayOf(start)) {

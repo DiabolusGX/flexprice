@@ -546,9 +546,16 @@ func TestPeriodDays_IntraDayWindows(t *testing.T) {
 	assert.Equal(t, "2026-09-23", p.End.Format("2006-01-02"))
 	assert.False(t, p.End.Before(dayOf(p.Start)), "a period may never end before it starts")
 
-	// Spanning into the next day, ending part-way through it.
+	// Ending part-way through a later day: that day opens the NEXT period, so
+	// it is not this one's last — the curve folds its usage into 09-24.
 	p = periodDays(day(2026, 9, 23, 9, 37), day(2026, 9, 25, 13, 7))
-	assert.Equal(t, "2026-09-25", p.End.Format("2006-01-02"))
+	assert.Equal(t, "2026-09-24", p.End.Format("2006-01-02"))
+
+	// Back-to-back periods must not both claim the shared boundary date.
+	first := periodDays(day(2026, 3, 31, 18, 30), day(2026, 6, 30, 18, 30))
+	second := periodDays(day(2026, 6, 30, 18, 30), day(2026, 9, 30, 18, 30))
+	assert.Equal(t, "2026-06-29", first.End.Format("2006-01-02"))
+	assert.True(t, first.End.Before(dayOf(second.Start)), "periods overlap on a day")
 
 	// Degenerate zero-length window still keys to its own day.
 	p = periodDays(day(2026, 9, 23, 9, 37), day(2026, 9, 23, 9, 37))
