@@ -24,8 +24,9 @@ type RevenueAnalyticsRequest struct {
 	// across their period's days.
 	AllocationPolicy types.RevenueAllocationPolicy `json:"allocation_policy"`
 
-	// Status selects booked (FINAL, default) or in-progress (PROVISIONAL)
-	// rows — never both in one response.
+	// Status restricts the response to booked (FINAL) or in-progress
+	// (PROVISIONAL) rows. Optional: left empty, both are returned and each
+	// row says which it is, so the two are never silently summed together.
 	Status types.FactStatus `json:"status"`
 
 	// GroupBy dimensions: revenue_source, source (the event source recorded in
@@ -83,11 +84,13 @@ func (r *RevenueAnalyticsRequest) Validate() error {
 	if err := r.AllocationPolicy.Validate(); err != nil {
 		return err
 	}
-	if r.Status == "" {
-		r.Status = types.FactFinal
-	}
-	if err := r.Status.Validate(); err != nil {
-		return err
+	// An empty status is not defaulted: it means "both", with status carried
+	// on each row. Defaulting to FINAL would hide the period currently
+	// accruing; defaulting to PROVISIONAL would hide all history.
+	if r.Status != "" {
+		if err := r.Status.Validate(); err != nil {
+			return err
+		}
 	}
 	for _, g := range r.GroupBy {
 		if !lo.Contains(revenueAnalyticsGroupBy, g) {
@@ -103,15 +106,24 @@ func (r *RevenueAnalyticsRequest) Validate() error {
 			WithHint("Pass customer_ids or subscription_ids when grouping by source").
 			Mark(ierr.ErrValidation)
 	}
-	// revenue_source is always a dimension: a revenue number is ambiguous
-	// without knowing whether it is usage, fixed, or an adjustment.
-	if !lo.Contains(r.GroupBy, "revenue_source") {
-		r.GroupBy = append(r.GroupBy, "revenue_source")
+	// Two dimensions are always applied. revenue_source, because a revenue
+	// number is ambiguous without knowing whether it is usage, fixed or an
+	// adjustment. currency, because adding amounts across currencies is not
+	// a number at all.
+	for _, always := range []string{"revenue_source", "currency"} {
+		if !lo.Contains(r.GroupBy, always) {
+			r.GroupBy = append(r.GroupBy, always)
+		}
 	}
 	return nil
 }
 
-// RevenueAnalyticsRow is one aggregated bucket.
+// RevenueAnalyticsRow is one aggregated bucket. A row is uniquely identified
+// by its group values (the requested group_by plus the always-applied
+// revenue_source and currency), its time bucket (day, or period bounds, or
+// nothing at total granularity), its status, and its adjustment_type.
+// Anything not in that key is summed into the row, which is why adding a
+// dimension changes what a row means rather than just labelling it.
 type RevenueAnalyticsRow struct {
 	// Group holds the requested dimensions and their values for this bucket.
 	Group map[string]string `json:"group,omitempty"`
@@ -120,6 +132,10 @@ type RevenueAnalyticsRow struct {
 	Day         *time.Time `json:"day,omitempty"`
 	PeriodStart *time.Time `json:"period_start,omitempty"`
 	PeriodEnd   *time.Time `json:"period_end,omitempty"`
+
+	// Status is the row's fact status. It is part of the row's identity, so a
+	// FINAL and a PROVISIONAL row for the same bucket stay separate.
+	Status types.FactStatus `json:"status"`
 
 	// AdjustmentType labels rows broken out by include_adjustments:
 	// "commitment_trueup", "overage" or "revert". Empty for plain rows.

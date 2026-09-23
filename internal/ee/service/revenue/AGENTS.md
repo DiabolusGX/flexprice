@@ -100,6 +100,27 @@ record it here.
 Bucketed lines never take the grant path: `GrantPricingGuard` rejects bucketed
 meters, so the engine does not fold grants there either.
 
+## What makes a row
+
+A row in `POST /analytics/revenue` is uniquely identified by:
+
+1. **Group values** — the requested `group_by`, plus `revenue_source` and
+   `currency`, which are always applied (a revenue number is ambiguous without
+   its kind, and amounts across currencies do not add).
+2. **Time bucket** — the day, the billing period's bounds, or nothing at
+   `total` granularity.
+3. **Status** — `FINAL` and `PROVISIONAL` rows for the same bucket stay
+   separate. Omit `status` in the request to get both.
+4. **Adjustment type** — only when `include_adjustments` splits true-up,
+   overage and revert out of their parent buckets.
+
+Everything outside that key is **summed into** the row. That is why adding a
+dimension changes what a row *means* rather than just labelling it: grouping by
+customer answers "revenue per customer", and adding `subscription_id` answers a
+different question with more rows. So dimensions are never added implicitly —
+if a caller needs subscription or price on the row, they ask for it in
+`group_by`, and the response's `query` echo records what was actually applied.
+
 ## What reconciliation actually checks
 
 Shadow-only — every mismatch is logged (`revenue_reconciliation_mismatch`,

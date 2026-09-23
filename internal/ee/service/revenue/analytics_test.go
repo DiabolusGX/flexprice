@@ -266,3 +266,59 @@ func TestGetRevenueAnalytics_DropsEmptyBuckets(t *testing.T) {
 	assert.True(t, entitled.NetAmount.IsZero())
 	assert.Equal(t, "40", entitled.EntitlementQty.String())
 }
+
+// TestGetRevenueAnalytics_StatusAndCurrencyAreRowIdentity: an omitted status
+// returns booked and in-progress rows side by side, each labelled, rather than
+// defaulting to one and silently hiding the other. Currency is always a
+// dimension too, because adding amounts across currencies is not a number.
+func TestGetRevenueAnalytics_StatusAndCurrencyAreRowIdentity(t *testing.T) {
+	ctx, svc, store, period := revenueAnalyticsFixture(t)
+
+	mk := func(id string, status types.FactStatus, currency string, net int64) *revenuefact.RevenueFact {
+		return &revenuefact.RevenueFact{
+			ID: id, CustomerID: "cust_ra", SubscriptionID: "sub_ra",
+			SubLineItemID: lo.ToPtr("sli_" + id), PriceID: lo.ToPtr("price_" + id),
+			RevenueSource: types.RevenueSourceUsage, PeriodStart: period.Start, PeriodEnd: period.End,
+			Day: period.Start, NetAmount: decimal.NewFromInt(net),
+			DecompositionMode: types.Marginal, Currency: currency, Status: status,
+		}
+	}
+	require.NoError(t, store.UpsertProvisional(ctx, []*revenuefact.RevenueFact{
+		mk("booked", types.FactProvisional, "usd", 70),
+		mk("eur", types.FactProvisional, "eur", 11),
+	}))
+	// The store stamps PROVISIONAL like Postgres does, so book one row the
+	// way finalization does.
+	flipped, err := store.FlipToFinal(ctx, "sub_ra", "price_booked", "sli_booked",
+		period.Start, period.End, "inv_ra", "ili_ra")
+	require.NoError(t, err)
+	require.Equal(t, 1, flipped)
+
+	req := &dto.RevenueAnalyticsRequest{
+		StartTime:   period.Start,
+		EndTime:     period.exclusiveEnd(),
+		Granularity: types.RevenueGranularityTotal,
+	}
+	res, err := svc.GetRevenueAnalytics(ctx, req)
+	require.NoError(t, err)
+
+	byStatusCurrency := map[string]decimal.Decimal{}
+	for _, r := range res.Rows {
+		assert.NotEmpty(t, r.Status, "every row says which status it is")
+		key := string(r.Status) + "/" + r.Group["currency"]
+		byStatusCurrency[key] = byStatusCurrency[key].Add(r.NetAmount)
+	}
+	assert.Equal(t, "70", byStatusCurrency["FINAL/usd"].String(), "booked rows come back unasked")
+	assert.Equal(t, "11", byStatusCurrency["PROVISIONAL/eur"].String(), "a second currency never merges into the first")
+	assert.True(t, byStatusCurrency["PROVISIONAL/usd"].IsPositive(), "the in-progress period is still there")
+
+	// Naming a status narrows to it.
+	req.Status = types.FactFinal
+	res, err = svc.GetRevenueAnalytics(ctx, req)
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Rows)
+	for _, r := range res.Rows {
+		assert.Equal(t, types.FactFinal, r.Status)
+	}
+	assert.Equal(t, types.FactFinal, res.Query.Status, "the echo reports what was applied")
+}

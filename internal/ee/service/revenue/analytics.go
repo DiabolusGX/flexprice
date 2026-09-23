@@ -231,10 +231,13 @@ func (a *revenueAggregation) add(f *revenuefact.RevenueFact, source string, frac
 // fold adds fraction x of f's metrics into the bucket for (group, adjustment
 // kind, time bucket).
 func (a *revenueAggregation) fold(group map[string]string, adjType string, day, periodStart, periodEnd *time.Time, f *revenuefact.RevenueFact, fraction decimal.Decimal) {
-	keyParts := make([]string, 0, len(a.req.GroupBy)+3)
+	keyParts := make([]string, 0, len(a.req.GroupBy)+4)
 	for _, g := range a.req.GroupBy {
 		keyParts = append(keyParts, group[g])
 	}
+	// Status is part of a row's identity: a booked row and an in-progress one
+	// for the same bucket describe different things and must not be summed.
+	keyParts = append(keyParts, string(f.Status))
 	if day != nil {
 		keyParts = append(keyParts, day.Format("2006-01-02"))
 	}
@@ -248,7 +251,10 @@ func (a *revenueAggregation) fold(group map[string]string, adjType string, day, 
 
 	row, ok := a.buckets[key]
 	if !ok {
-		row = &dto.RevenueAnalyticsRow{Day: day, PeriodStart: periodStart, PeriodEnd: periodEnd, AdjustmentType: adjType}
+		row = &dto.RevenueAnalyticsRow{
+			Day: day, PeriodStart: periodStart, PeriodEnd: periodEnd,
+			Status: f.Status, AdjustmentType: adjType,
+		}
 		if len(group) > 0 {
 			row.Group = group
 		}
@@ -321,6 +327,7 @@ func rowSortKey(r *dto.RevenueAnalyticsRow) string {
 	for _, k := range keys {
 		parts = append(parts, r.Group[k])
 	}
+	parts = append(parts, string(r.Status))
 	if r.AdjustmentType != "" {
 		// The "~" prefix sorts after every printable group value, keeping
 		// adjustment rows below their plain siblings in the same time bucket.

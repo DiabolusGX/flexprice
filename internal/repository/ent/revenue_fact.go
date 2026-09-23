@@ -511,8 +511,11 @@ func (r *revenueFactRepository) ListFacts(ctx context.Context, filter revenuefac
 			entrevenuefact.EnvironmentID(environmentID),
 			entrevenuefact.DayGTE(filter.DayStart),
 			entrevenuefact.DayLTE(filter.DayEnd),
-			entrevenuefact.StatusEQ(filter.Status),
 		)
+	// An empty status means both booked and in-progress rows.
+	if filter.Status != "" {
+		q = q.Where(entrevenuefact.StatusEQ(filter.Status))
+	}
 	if len(filter.CustomerIDs) > 0 {
 		q = q.Where(entrevenuefact.CustomerIDIn(filter.CustomerIDs...))
 	}

@@ -6085,8 +6085,9 @@ definitions:
         allOf:
         - $ref: '#/definitions/types.FactStatus'
         description: |-
-          Status selects booked (FINAL, default) or in-progress (PROVISIONAL)
-          rows — never both in one response.
+          Status restricts the response to booked (FINAL) or in-progress
+          (PROVISIONAL) rows. Optional: left empty, both are returned and each
+          row says which it is, so the two are never silently summed together.
       subscription_ids:
         items:
           type: string
@@ -6148,6 +6149,12 @@ definitions:
         type: string
       period_start:
         type: string
+      status:
+        allOf:
+        - $ref: '#/definitions/types.FactStatus'
+        description: |-
+          Status is the row's fact status. It is part of the row's identity, so a
+          FINAL and a PROVISIONAL row for the same bucket stay separate.
       tier_delta:
         type: number
       usage_at_list_rate:

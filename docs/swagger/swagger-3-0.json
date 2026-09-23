@@ -24149,6 +24149,9 @@
             "type": "string",
             "format": "date-time"
           },
+          "status": {
+            "$ref": "#/components/schemas/types.FactStatus"
+          },
           "tier_delta": {
             "type": "number"
           },

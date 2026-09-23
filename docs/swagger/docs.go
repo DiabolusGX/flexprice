@@ -22071,7 +22071,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "status": {
-                    "description": "Status selects booked (FINAL, default) or in-progress (PROVISIONAL)\nrows — never both in one response.",
+                    "description": "Status restricts the response to booked (FINAL) or in-progress\n(PROVISIONAL) rows. Optional: left empty, both are returned and each\nrow says which it is, so the two are never silently summed together.",
                     "allOf": [
                         {
                             "$ref": "#/definitions/types.FactStatus"
@@ -22150,6 +22150,14 @@ const docTemplate = `{
                 },
                 "period_start": {
                     "type": "string"
+                },
+                "status": {
+                    "description": "Status is the row's fact status. It is part of the row's identity, so a\nFINAL and a PROVISIONAL row for the same bucket stay separate.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/types.FactStatus"
+                        }
+                    ]
                 },
                 "tier_delta": {
                     "type": "number"

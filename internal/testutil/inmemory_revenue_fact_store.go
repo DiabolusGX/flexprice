@@ -324,7 +324,10 @@ func (s *InMemoryRevenueFactStore) ListFacts(ctx context.Context, filter revenue
 		if !CheckTenantFilter(ctx, f.TenantID) || !CheckEnvironmentFilter(ctx, f.EnvironmentID) {
 			continue
 		}
-		if f.Status != filter.Status || f.Day.Before(filter.DayStart) || f.Day.After(filter.DayEnd) {
+		if filter.Status != "" && f.Status != filter.Status {
+			continue
+		}
+		if f.Day.Before(filter.DayStart) || f.Day.After(filter.DayEnd) {
 			continue
 		}
 		if !contains(filter.CustomerIDs, f.CustomerID) || !contains(filter.SubscriptionIDs, f.SubscriptionID) {
